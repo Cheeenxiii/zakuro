@@ -27,10 +27,12 @@ pub enum Screens {
     TopOnly,
     BottomOnly,
     LargeTop,
+    Inset,
 }
 
 impl Screens {
-    pub const ALL: [Screens; 5] = [Screens::Stacked, Screens::SideBySide, Screens::LargeTop, Screens::TopOnly, Screens::BottomOnly];
+    pub const ALL: [Screens; 6] =
+        [Screens::Stacked, Screens::SideBySide, Screens::LargeTop, Screens::Inset, Screens::TopOnly, Screens::BottomOnly];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -39,6 +41,7 @@ impl Screens {
             Screens::TopOnly => "Top screen only",
             Screens::BottomOnly => "Bottom screen only",
             Screens::LargeTop => "Big top screen, small bottom one",
+            Screens::Inset => "Small bottom screen over the top one",
         }
     }
 
@@ -49,6 +52,7 @@ impl Screens {
             Screens::TopOnly => ScreenLayout::TopOnly,
             Screens::BottomOnly => ScreenLayout::BottomOnly,
             Screens::LargeTop => ScreenLayout::LargeTop,
+            Screens::Inset => ScreenLayout::Inset,
         }
     }
 

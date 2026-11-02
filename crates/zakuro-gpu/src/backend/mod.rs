@@ -103,6 +103,9 @@ pub enum ScreenLayout {
     BottomOnly,
     /// the top screen big, the bottom one small at its lower right.
     LargeTop,
+    /// the top screen alone, with the bottom one small over its lower
+    /// right corner.
+    Inset,
 }
 
 /// how the screens' pixels are drawn when scaled to the window.
@@ -141,7 +144,7 @@ impl ScreenLayout {
         match self {
             ScreenLayout::Stacked => (top_width.max(320.0), 480.0),
             ScreenLayout::SideBySide => (top_width + 320.0, 240.0),
-            ScreenLayout::TopOnly => (top_width, 240.0),
+            ScreenLayout::TopOnly | ScreenLayout::Inset => (top_width, 240.0),
             ScreenLayout::BottomOnly => (320.0, 240.0),
             ScreenLayout::LargeTop => (top_width + LARGE_TOP_BOTTOM.0 as f32, 240.0),
         }
@@ -155,6 +158,11 @@ pub const TOP_WIDTH: f32 = 400.0;
 
 /// the bottom screen's size next to the big top one, half the console's.
 const LARGE_TOP_BOTTOM: (u32, u32) = (160, 120);
+
+/// the bottom screen's size over the top one, as a share of the top
+/// screen's scale, and its distance from the corner in console pixels.
+const INSET_SHARE: f32 = 0.4;
+const INSET_MARGIN: f32 = 4.0;
 
 /// works out where the screens go inside a window, keeping the 3DS's
 /// aspect ratio, or the top screen top_w wide, and centring them, scaled by
@@ -203,6 +211,17 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
             Some(Viewport {
                 x: offset_x + top_w * scale,
                 y: offset_y + 240.0 * scale - 240.0 * small,
+                width: 320.0 * small,
+                height: 240.0 * small,
+            })
+        }
+        ScreenLayout::Inset => {
+            let share = INSET_SHARE * scale;
+            let small = if integer && share >= 1.0 { share.floor() } else { share };
+            let margin = INSET_MARGIN * scale;
+            Some(Viewport {
+                x: offset_x + top_w * scale - 320.0 * small - margin,
+                y: offset_y + 240.0 * scale - 240.0 * small - margin,
                 width: 320.0 * small,
                 height: 240.0 * small,
             })
@@ -389,6 +408,19 @@ mod tests {
         let (top, bottom) = (top.unwrap(), bottom.unwrap());
         assert_eq!((top.x, top.y, top.width, top.height), (0.0, 0.0, 800.0, 480.0));
         assert_eq!((bottom.x, bottom.y, bottom.width, bottom.height), (800.0, 240.0, 320.0, 240.0));
+    }
+
+    #[test]
+    fn the_inset_bottom_screen_sits_inside_the_top_one() {
+        // the top screen fills the window as alone, the bottom one is drawn
+        // over its lower right corner, after it
+        let (top, bottom) = layout(800, 480, ScreenLayout::Inset, TOP_WIDTH, false);
+        let (top, bottom) = (top.unwrap(), bottom.unwrap());
+        assert_eq!((top.x, top.y, top.width, top.height), (0.0, 0.0, 800.0, 480.0));
+        assert_eq!((bottom.x, bottom.y, bottom.width, bottom.height), (536.0, 280.0, 256.0, 192.0));
+        let places = place(800, 480, ScreenLayout::Inset, TOP_WIDTH, false, Stereo::default(), false);
+        assert_eq!(places.iter().map(|(_, shown)| *shown).collect::<Vec<_>>(), [Shown::Top, Shown::Bottom]);
+        assert_eq!(ScreenLayout::Inset.size(TOP_WIDTH), (400, 240));
     }
 
     /// a wider top screen fills a window of its shape, and the screens

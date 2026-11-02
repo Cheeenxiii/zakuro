@@ -26,7 +26,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use zakuro_common::Screen;
-use zakuro_core::{loader, Config, FrameOutcome, System};
+use zakuro_core::{loader, Config, FrameOutcome};
 use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage};
 
 use gui::Gui;
@@ -37,16 +37,52 @@ use present::Backend;
 use recompile::{Job, Stage, Toolchain};
 use settings::{CameraSource, Renderer, Screens, Settings};
 
+pub use egui;
 pub use zakuro_core::memory::Memory;
 pub use zakuro_core::recompiled::Linked;
+pub use zakuro_core::services::hid::{InputState, PadState};
+pub use zakuro_core::System;
+pub use zakuro_gpu::backend::ScreenLayout;
 
 /// what a program built on Zakuro shows over its game, worked out from the
 /// game's memory: a line kept in a corner, and a notice shown for a moment.
 /// a recompiled game can show what the game keeps hidden this way, its
 /// alignment, a timer, without drawing into the game's own screens.
+///
+/// one that does more can also change the input the game sees, draw its own
+/// interface over the top screen and choose how the screens are arranged.
+/// every method has a default doing nothing, so an overlay implements only
+/// what it uses, frame or after_frame among them.
 pub trait GameOverlay {
     /// called after each frame the game runs, with its memory.
-    fn frame(&mut self, memory: &mut Memory) -> OverlayText;
+    fn frame(&mut self, _memory: &mut Memory) -> OverlayText {
+        OverlayText::default()
+    }
+
+    /// called after each frame the game runs, with the whole console, for
+    /// an overlay that needs more than the memory, the modules the game
+    /// loaded say. calls frame unless implemented.
+    fn after_frame(&mut self, system: &mut System) -> OverlayText {
+        self.frame(&mut system.memory)
+    }
+
+    /// called before each frame with what the player is pressing, returns
+    /// what the game sees: the same, less what the overlay keeps for its
+    /// own interface, plus what it presses for the player. a replay plays
+    /// back what the game saw and does not call it.
+    fn input(&mut self, player: InputState) -> InputState {
+        player
+    }
+
+    /// draws over the game each time the window is drawn. top is where the
+    /// top screen is, in egui's points, none when it does not show.
+    fn draw(&mut self, _ctx: &egui::Context, _top: Option<egui::Rect>) {}
+
+    /// how the screens should be arranged after the last frame, none to
+    /// leave them as the player chose.
+    fn screens(&self) -> Option<ScreenLayout> {
+        None
+    }
 }
 
 /// what a GameOverlay shows after a frame.
@@ -102,6 +138,7 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         settings,
         linked,
         overlay,
+        overlay_screens: None,
         overlay_corner: None,
         library: Library::new(data_dir.clone()),
         data_dir,
@@ -370,6 +407,8 @@ struct App {
     /// what the program built on Zakuro shows over the game, and the line it
     /// keeps in the corner now.
     overlay: Option<Box<dyn GameOverlay>>,
+    /// the arrangement the overlay asks for, over the player's.
+    overlay_screens: Option<ScreenLayout>,
     overlay_corner: Option<String>,
     data_dir: Option<PathBuf>,
     game: Option<Running>,
@@ -516,7 +555,7 @@ impl ApplicationHandler for App {
         match backend {
             Ok((window, mut backend)) => {
                 log::info!("presenting with the {} backend", backend.name());
-                backend.set_layout(self.layout.screens());
+                backend.set_layout(self.screens());
                 backend.set_top_width(self.settings.top_shape.width());
                 backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
                 backend.set_stereo(self.settings.stereo());
@@ -741,6 +780,7 @@ impl App {
     fn back_to_library(&mut self) {
         self.game = None;
         self.overlay_corner = None;
+        self.overlay_wants(None);
         if let Some(room) = &self.room {
             room.playing("");
         }
@@ -836,7 +876,7 @@ impl App {
     fn touch(&mut self) {
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
-        let (_, bottom) = layout(size.width, size.height, self.layout.screens(), self.top_shape.width(), self.settings.integer_scale);
+        let (_, bottom) = layout(size.width, size.height, self.screens(), self.top_shape.width(), self.settings.integer_scale);
         // with the top screen alone there is nothing to touch
         let Some(bottom) = bottom else {
             self.keyboard.touch(None);
@@ -951,8 +991,9 @@ impl App {
             self.scale = scale;
             self.layout = self.settings.layout;
             self.top_shape = self.settings.top_shape;
+            let screens = self.screens();
             if let Some(backend) = &mut self.backend {
-                backend.set_layout(self.layout.screens());
+                backend.set_layout(screens);
             }
             // a full screen or maximized window keeps its size, resizing
             // it would take it out of that, full screen fits it on leaving
@@ -1309,12 +1350,44 @@ impl App {
         }
     }
 
+    /// how the screens are arranged now: as the overlay asks while its game
+    /// runs, else as the player chose.
+    fn screens(&self) -> ScreenLayout {
+        self.overlay_screens.unwrap_or(self.layout.screens())
+    }
+
+    /// arranges the screens as the overlay asks, none for the player's way.
+    fn overlay_wants(&mut self, screens: Option<ScreenLayout>) {
+        if screens == self.overlay_screens {
+            return;
+        }
+        self.overlay_screens = screens;
+        let screens = self.screens();
+        if let Some(backend) = &mut self.backend {
+            backend.set_layout(screens);
+        }
+    }
+
+    /// whether a game runs and it is the one the program was built on, the
+    /// only one the overlay reads, not another one its library opened.
+    fn ours(&self) -> bool {
+        let Some(game) = &self.game else { return false };
+        self.linked.as_ref().is_none_or(|linked| game.system.title.as_ref().is_some_and(|title| title.program_id() == linked.program_id()))
+    }
+
     /// runs one frame of the game.
     fn emulate(&mut self) {
+        let ours = self.ours();
         let Some(game) = &mut self.game else { return };
         let input = match &mut game.replay {
             Some(replay) => replay.input(game.frame),
-            None => self.gamepads.apply(self.keyboard.state()),
+            None => {
+                let player = self.gamepads.apply(self.keyboard.state());
+                match self.overlay.as_mut().filter(|_| ours) {
+                    Some(overlay) => overlay.input(player),
+                    None => player,
+                }
+            }
         };
         game.frame += 1;
         if let Some(recorder) = &mut game.recorder {
@@ -1322,16 +1395,17 @@ impl App {
         }
         game.system.set_input(input);
         let outcome = game.system.run_frame();
-        // the overlay reads the game the program was built on, not another
-        // one its library opened
-        let ours = self.linked.as_ref().is_none_or(|linked| game.system.title.as_ref().is_some_and(|title| title.program_id() == linked.program_id()));
+        let mut screens = None;
         if let Some(overlay) = self.overlay.as_mut().filter(|_| ours) {
-            let text = overlay.frame(&mut game.system.memory);
+            let text = overlay.after_frame(&mut game.system);
+            screens = overlay.screens();
             self.overlay_corner = text.corner;
             if let Some(notice) = text.notice {
                 self.menus.toast = Some((notice, Instant::now()));
             }
         }
+        self.overlay_wants(screens);
+        let Some(game) = &mut self.game else { return };
         game.count_frame();
         let sound = game.system.take_audio();
         // fast forward plays no sound, there is too much of it too soon
@@ -1554,6 +1628,7 @@ impl App {
             .flatten()
             .and_then(|path| std::fs::metadata(path).ok()?.modified().ok())
             .map(ago);
+        let (ours, screens) = (self.ours(), self.screens());
         let (Some(gui), Some(window)) = (&mut self.gui, &self.window) else { return Overlay::default() };
         let show_fps = self.settings.show_fps;
         let game = self.game.as_ref().map(|game| (game.name.clone(), game.fps, game.system.recompiled.is_some()));
@@ -1572,9 +1647,21 @@ impl App {
             game.system.cheats.iter().map(|cheat| (cheat.name.clone(), cheat.enabled, cheat.notes.join("\n"), cheat.builtin)).collect::<Vec<_>>()
         });
         let corner = self.overlay_corner.clone().filter(|_| game.is_some());
+        // where the top screen is, in egui's points, for the overlay to draw
+        // its interface over it
+        let size = window.inner_size();
+        let points = gui.ctx.pixels_per_point();
+        let top = layout(size.width, size.height, screens, self.top_shape.width(), self.settings.integer_scale)
+            .0
+            .map(|top| egui::Rect::from_min_size(egui::pos2(top.x, top.y) / points, egui::vec2(top.width, top.height) / points));
+        let mut game_overlay = self.overlay.as_mut().filter(|_| ours);
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
         let mut actions = Vec::new();
         let overlay = gui.frame(window, |ui| {
+            // under the menus, which open over it
+            if let Some(game_overlay) = game_overlay.as_mut() {
+                game_overlay.draw(ui.ctx(), top);
+            }
             match &game {
                 Some((name, fps, recompiled)) => {
                     actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, fast, jobs, saved.as_deref()));
